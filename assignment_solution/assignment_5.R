@@ -1,6 +1,13 @@
+new_tempdir <- "C:/Your/Custom/TempDir"
+if (!dir.exists(new_tempdir)) {
+  dir.create(new_tempdir, recursive = TRUE)
+}
+tempdir(new_tempdir)
 library(dplyr)
 library(evd)
 library(purrr)
+library(doParallel)
+library(foreach)
 options(scipen = 20)
 #### Generate Data ####
 set.seed(1)
@@ -76,7 +83,6 @@ compute_indirect_utility <- function(df, beta, sigma, mu, omega){
     (exp(mu+omega*df$v_p) * df$p) + df$xi
   return(u)
 }
-u <- compute_indirect_utility(df, beta, sigma, mu, omega)
 
 # Smooth Choice Function
 compute_choice_smooth <- function(df, beta, sigma, mu, omega){
@@ -113,29 +119,35 @@ compute_share_smooth <- function(df, beta, sigma, mu, omega){
   return(df_share)
 }
 
-compute_derivative_share_smooth <- function(df, beta, sigma, mu, omega){
+# Smooth Derivative Function
+compute_derivative_share_smooth <- function(df, beta, sigma, mu, omega) {
   # Part I: Compute Choice
   df <- compute_choice_smooth(df, beta, sigma, mu, omega)
   df <- df %>% filter(j != 0)
-  df$alpha_i <- mu + omega * df$v_p
+  df$alpha_i <- -exp(mu + omega * df$v_p)
   
   # Part II: For each market, compute the derivative of share with respect to price, put results in a list
   T <- length(unique(df$t))
-  result <- list(length = T)
-  for (t in 1:T) {
-    print(t)
-    data_j <- df %>% filter(t == t)
+  
+  # Initialize parallel backend
+  cores <- detectCores()
+  cl <- makeCluster(cores)
+  registerDoParallel(cl)
+  
+  result <- foreach(l = 1:T, .packages = c("dplyr")) %dopar% {
+    data_j <- df %>% filter(t == l)
     J_t <- length(unique(data_j$j))
     matrix <- matrix(0, nrow = J_t, ncol = J_t)
     j_list <- unique(data_j$j)
-    for (j in 1:J_t) {
-      for (k in 1:J_t) {
-        if (j == k) {
-          data_jk <- data_j %>% filter(j == j_list[j])
+    
+    for (m in 1:J_t) {
+      for (n in 1:J_t) {
+        if (m == n) {
+          data_jk <- data_j %>% filter(j == j_list[m])
           data_jk$obj <- data_jk$alpha_i * data_jk$q * (1 - data_jk$q)
-          matrix[j, k] <- mean(data_jk$obj)
+          matrix[m, n] <- mean(data_jk$obj)
         } else {
-          data_jk <- data_j %>% filter(j == j_list[j] | j == j_list[k])
+          data_jk <- data_j %>% filter(j == j_list[m] | j == j_list[n])
           data_jk <- data_jk %>%
             arrange(i, j) %>%
             group_by(i) %>%
@@ -143,12 +155,88 @@ compute_derivative_share_smooth <- function(df, beta, sigma, mu, omega){
             ungroup() %>%
             filter(!is.na(lag_q))
           data_jk$obj <- data_jk$alpha_i * data_jk$q * data_jk$lag_q
-          matrix[j, k] <- -mean(data_jk$obj)
+          matrix[m, n] <- -mean(data_jk$obj)
         }
       }
     }
-    result[[t]] <- matrix
+    
+    matrix
   }
+  
+  # Stop parallel backend
+  stopCluster(cl)
+  
   return(result)
 }
-result <- compute_derivative_share_smooth(df, beta, sigma, mu, omega)
+
+# Delta Matrix: Identity Matrix
+delta <- 
+  foreach (tt = 1:T) %do% {
+    J_t <- M %>%
+      dplyr::filter(t == tt) %>%
+      dplyr::filter(j > 0) 
+    J_t <- dim(J_t)[1]
+    Delta_t <- diag(rep(1, J_t))
+    return(Delta_t)
+  }
+
+# Update Price Function
+update_price<-function(p, x, M, V, beta, sigma, mu, omega,delta){
+  # Part I: construct df based on the logp
+  M[M$j != 0, "p"] <- p
+  df <- expand.grid(t = 1:T, i = 1:N, j = 0:J)
+  df <- left_join(df, M, by = c("j", "t"))
+  df <- left_join(df, V, by = c("i", "t"))
+  df <- left_join(df, x, by = "j")
+  df <- df %>% dplyr::filter(!is.na(p)) %>% dplyr::arrange(t,i,j)
+  # Part II: compute share and derivative of share
+  df_share <- compute_share_smooth(df, beta, sigma, mu, omega)
+  df_share <- df_share %>% dplyr::filter(j != 0)
+  derivative_share <- compute_derivative_share_smooth(df, beta, sigma, mu, omega)
+  # Part III: compute the update of price
+  M <- M %>% dplyr::filter(j != 0)
+  for (l in 1:T) {
+    c_t <- M %>% dplyr::filter(t == l) %>% dplyr::select(c) %>% as.matrix()
+    omega_t <- derivative_share[[l]] %*% delta[[l]]
+    s_t <- df_share %>% dplyr::filter(t == l) %>% dplyr::select(s) %>% as.matrix()
+    pt1 = c_t + solve(-omega_t) %*% s_t
+    M[M$t == l, "p"] <- pt1
+  }
+  new_p <- M$p
+  return(new_p)
+}
+
+# set the threshold
+lambda <- 1e-2
+# set the initial price
+p <- M[M$j > 0, "p"]
+p_init <- M[M$j > 0, "c"] * 1.2
+p_new <- update_price(
+  p = p_init, 
+  x = x, 
+  M = M, 
+  V = V, 
+  beta = beta, 
+  sigma = sigma, 
+  mu = mu, 
+  omega = omega,
+  delta = delta
+)
+distance <- 10000
+while (distance > lambda) {
+  p_old <- p_new
+  p_new <- 
+    update_price(
+      p_old, 
+      x, 
+      M, 
+      V, 
+      beta, 
+      sigma, 
+      mu, 
+      omega,
+      delta
+    )
+  distance <- max(abs(p_new - p_old))
+  print(distance)
+}
