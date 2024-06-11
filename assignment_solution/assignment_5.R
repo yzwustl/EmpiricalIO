@@ -8,8 +8,9 @@ library(evd)
 library(purrr)
 library(doParallel)
 library(foreach)
+library(ggplot2)
 options(scipen = 20)
-#### Generate Data ####
+######## Part I: Generate Data ########
 set.seed(1)
 J <- 10  # number of products
 K <- 3   # dimension of product characteristics including the intercept
@@ -182,7 +183,7 @@ delta <-
 
 # Update Price Function
 update_price<-function(p, x, M, V, beta, sigma, mu, omega,delta){
-  # Part I: construct df based on the logp
+  # Part I: construct df based on the p
   M[M$j != 0, "p"] <- p
   df <- expand.grid(t = 1:T, i = 1:N, j = 0:J)
   df <- left_join(df, M, by = c("j", "t"))
@@ -197,7 +198,7 @@ update_price<-function(p, x, M, V, beta, sigma, mu, omega,delta){
   M <- M %>% dplyr::filter(j != 0)
   for (l in 1:T) {
     c_t <- M %>% dplyr::filter(t == l) %>% dplyr::select(c) %>% as.matrix()
-    omega_t <- derivative_share[[l]] %*% delta[[l]]
+    omega_t <- delta[[l]] * derivative_share[[l]]
     s_t <- df_share %>% dplyr::filter(t == l) %>% dplyr::select(s) %>% as.matrix()
     pt1 = c_t + solve(-omega_t) %*% s_t
     M[M$t == l, "p"] <- pt1
@@ -207,10 +208,10 @@ update_price<-function(p, x, M, V, beta, sigma, mu, omega,delta){
 }
 
 # set the threshold
-lambda <- 1e-2
+lambda <- 1e-6
 # set the initial price
 p <- M[M$j > 0, "p"]
-p_init <- M[M$j > 0, "c"] * 1.2
+p_init <- rep(1,dim(p)[1])
 p_new <- update_price(
   p = p_init, 
   x = x, 
@@ -240,3 +241,235 @@ while (distance > lambda) {
   distance <- max(abs(p_new - p_old))
   print(distance)
 }
+p_actual <- p_new
+################# Part II: Cost Estimation #################
+estimate_marginal_cost <- function(p = p, x = x, M = M, V = V, beta = beta,  sigma = sigma, mu = mu, omega = omega, delta = delta){
+  # Part I: construct df based on the p
+  M[M$j != 0, "p"] <- p_actual
+  df <- expand.grid(t = 1:T, i = 1:N, j = 0:J)
+  df <- left_join(df, M, by = c("j", "t"))
+  df <- left_join(df, V, by = c("i", "t"))
+  df <- left_join(df, x, by = "j")
+  df <- df %>% dplyr::filter(!is.na(p)) %>% dplyr::arrange(t,i,j)
+  # Part II: compute share and derivative of share
+  df_share <- compute_share_smooth(df, beta, sigma, mu, omega)
+  df_share <- df_share %>% dplyr::filter(j != 0)
+  derivative_share <- compute_derivative_share_smooth(df, beta, sigma, mu, omega)
+  # Part III: compute the cost estimation
+  M <- M %>% dplyr::filter(j != 0)
+  for (l in 1:T) {
+    p_t <- M %>% dplyr::filter(t == l) %>% dplyr::select(p) %>% as.matrix()
+    omega_t <-  delta[[l]] * derivative_share[[l]]
+    s_t <- df_share %>% dplyr::filter(t == l) %>% dplyr::select(s) %>% as.matrix()
+    ct = p_t - solve(-omega_t,s_t)
+    M[M$t == l, "c"] <- ct
+  }
+  new_c <- M$c
+  return(new_c)
+}
+marginal_cost_estimate <- 
+  estimate_marginal_cost(
+    p = p_new, 
+    x = x, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega, 
+    delta = delta)
+marginal_cost_actual <- M[M$j > 0, ]$c
+
+# plot the estimate vs actual marginal costs
+marginal_cost_df <-
+  data.frame(
+    actual = marginal_cost_actual,
+    estimate = marginal_cost_estimate
+  )
+ggplot(
+  marginal_cost_df, 
+  aes(
+    x = estimate, 
+    y = actual
+  )
+) +
+  geom_point() + 
+  theme_classic()
+
+################# Part III: Counter factual Analysis #################
+# Delta Matrix: Company 1 merges with 2 and 3
+delta_counterfactual <- 
+  foreach (tt = 1:T) %do% {
+    J_t <- M %>% dplyr::filter(t == tt) %>% dplyr::filter(j > 0)
+    J_list <- J_t$j
+    Jt <- dim(J_t)[1]
+    Delta_t <- diag(rep(1, Jt))
+    for (j in J_list) {
+      if (j == 1 | j == 2 | j == 3) {
+        j_index <- which(J_list == j)
+        for (l in J_list) {
+          if (l == 1 | l == 2 | l == 3) {
+            l_index <- which(J_list == l)
+            Delta_t[j_index,l_index] <- 1
+          }
+        }
+      }
+    }
+    return(Delta_t)
+  }
+
+# Compute conterfactual price
+p_new <- 
+  update_price(
+    p = p_actual, 
+    x = x, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega, 
+    delta = delta_counterfactual
+  )
+distance <- 10000
+while (distance > lambda) {
+  p_old <- p_new
+  p_new <- 
+    update_price(
+      p_old,
+      x, 
+      M, 
+      V, 
+      beta, 
+      sigma, 
+      mu, 
+      omega, 
+      delta_counterfactual
+    )
+  distance <- max(abs(p_new - p_old))
+  print(distance)
+}
+p_counterfactual <- p_new
+
+# Compute price change
+M_counterfactual<-M
+M_counterfactual$p_actual<-0
+M_counterfactual[M_counterfactual$j>0,]$p_actual<-p_actual
+
+M_counterfactual$p_counterfactual<-0
+M_counterfactual[M_counterfactual$j>0,]$p_counterfactual<-p_counterfactual 
+
+p_change<-M_counterfactual[M_counterfactual$j>0,] %>%
+  dplyr::mutate(p_change=(p_counterfactual-p_actual)/p_actual)%>%
+  dplyr::group_by(j)%>%
+  dplyr::summarise(p_change=mean(p_change))%>%
+  dplyr::ungroup()
+ 
+# Producer Surplus Function
+compute_producer_surplus<-function(p, marginal_cost, x, M, V, beta, sigma, mu, omega){
+  # Part I: construct df based on the p
+  M[M$j != 0, "p"] <- p
+  df <- expand.grid(t = 1:T, i = 1:N, j = 0:J)
+  df <- left_join(df, M, by = c("j", "t"))
+  df <- left_join(df, V, by = c("i", "t"))
+  df <- left_join(df, x, by = "j")
+  df <- df %>% dplyr::filter(!is.na(p)) %>% dplyr::arrange(t,i,j)
+  # Part II: compute share and derivative of share
+  df_share <- compute_share_smooth(df, beta, sigma, mu, omega)
+  df_share <- df_share %>% dplyr::filter(j != 0)
+  # Part III: compute the producer surplus
+  M[M$j != 0, "c"] <- marginal_cost
+  M[M$j != 0, "s"] <- df_share$s
+  M <- M %>% dplyr::filter(j != 0)
+  producer_surplus <- M$s * (M$p - M$c)
+  return(producer_surplus)
+}
+producer_surplus_actual <-
+  compute_producer_surplus(
+    p = p_actual, 
+    marginal_cost = marginal_cost_estimate, 
+    x = x, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+  )
+summary(producer_surplus_actual)
+producer_surplus_counterfactual <-
+  compute_producer_surplus(
+    p = p_counterfactual, 
+    marginal_cost = marginal_cost_estimate, 
+    x = x, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+  )
+summary(producer_surplus_counterfactual)
+
+# Compute Consumer Surplus Change
+M_counterfactual$producer_surplus_actual<-0
+M_counterfactual[M_counterfactual$j>0,]$producer_surplus_actual<-producer_surplus_actual
+
+M_counterfactual$producer_surplus_counterfactual<-0
+M_counterfactual[M_counterfactual$j>0,]$producer_surplus_counterfactual<-producer_surplus_counterfactual
+
+change<-M_counterfactual[M_counterfactual$j>0,]%>%
+  dplyr::mutate(producer_surplus_change=(producer_surplus_counterfactual-producer_surplus_actual)/producer_surplus_actual)%>%
+  dplyr::group_by(j)%>%
+  dplyr::summarise(producer_surplus_change=mean(producer_surplus_change))%>%
+  dplyr::ungroup()
+head(change,n=10) 
+
+# Consumer Surplus Function
+compute_consumer_surplus<-function(p, x, M, V, beta,sigma, mu, omega){
+  # Part I: construct df based on the p
+  M[M$j != 0, "p"] <- p
+  df <- expand.grid(t = 1:T, i = 1:N, j = 0:J)
+  df <- left_join(df, M, by = c("j", "t"))
+  df <- left_join(df, V, by = c("i", "t"))
+  df <- left_join(df, x, by = "j")
+  df <- df %>% dplyr::filter(!is.na(p)) %>% dplyr::arrange(t,i,j)
+  # Part II: compute indirect utility and alpha_i
+  df$u <- compute_indirect_utility(df, beta, sigma, mu, omega)
+  df$alpha_i <-  - exp(mu + omega * df$v_p)
+  # Part III: compute the consumer surplus
+  consumer_surplus <- df %>% dplyr::group_by(t, i) %>%
+    dplyr::mutate(consumer_surplus = log(sum(exp(u))) / abs(alpha_i)) %>%
+    dplyr::ungroup() %>%
+    dplyr::distinct(t, i, .keep_all = TRUE)
+  return(consumer_surplus$consumer_surplus)
+}
+
+consumer_surplus_actual <- 
+  compute_consumer_surplus(
+    p = p_actual, 
+    x = x, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+  )
+consumer_surplus_counterfactual <- 
+  compute_consumer_surplus(
+    p = p_counterfactual, 
+    x = x, 
+    M = M, 
+    V = V, 
+    beta = beta, 
+    sigma = sigma, 
+    mu = mu, 
+    omega = omega
+  )
+consumer_surplus_change <- 
+  (sum(consumer_surplus_counterfactual) - 
+     sum(consumer_surplus_actual)) /
+  sum(consumer_surplus_actual)
+consumer_surplus_change
+
