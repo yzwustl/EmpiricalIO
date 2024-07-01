@@ -262,15 +262,8 @@ simulate_dynamic_decision <-
       # state
       s_t <- df[t, "s"]
       # draw action
-      p_t <- 
-        p[((K + 1) * (s_t - 1) + 1):
-            ((K + 1) * (s_t - 1) + K + 1)]
-      a_t <- 
-        rmultinom(
-          1, 
-          1, 
-          prob = p_t
-          )
+      p_t <- p[((K + 1) * (s_t - 1) + 1):((K + 1) * (s_t - 1) + K + 1)]
+      a_t <- rmultinom(1, 1, prob = p_t)
       a_t <- which(as.logical(a_t)) - 1
       df[t, "a"] <- a_t
       # draw next state
